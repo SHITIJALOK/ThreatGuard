@@ -11,11 +11,11 @@ from typing import Optional
 import numpy as np
 
                                                                
-FLOW_TIMEOUT = 10.0                                                                    
+FLOW_TIMEOUT = 3.0                                                                    
                                                    
 MAX_FLOW_PACKETS = 200
                                                       
-MIN_FLOW_PACKETS = 10                                                 
+MIN_FLOW_PACKETS = 2                                                 
 
 @dataclass
 class FlowRecord:

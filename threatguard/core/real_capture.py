@@ -127,7 +127,7 @@ class RealCaptureThread(QThread):
         feature_names_path: Optional[str] = None,
         model_name: str = "Custom Model",
         prevention_enabled: bool = True,
-        confidence_threshold: float = 0.90,
+        confidence_threshold: float = 0.40,
         sensitivity_profile: str = "Balanced",
         test_mode: bool = False,
         parent=None,
@@ -182,12 +182,12 @@ class RealCaptureThread(QThread):
         self._sensitivity_profile = profile
 
     def _thresholds(self) -> dict[str, float]:
-        if self._test_mode or self._sensitivity_profile == "Aggressive":
-            return {"stage1": 0.70, "stage2": 0.55, "block": 0.75}
-        if self._sensitivity_profile == "Strict":
-            return {"stage1": 0.92, "stage2": 0.82, "block": 0.95}
-        return {"stage1": 0.85, "stage2": 0.70, "block": self._confidence_threshold}
-
+        return{
+        "stage1": 0.40,
+        "stage2": 0.30,
+        "block": 0.40
+    }
+    
     def set_binary_model(self, path: str):
         self._binary_model_path = path
         self._binary_model = None                
@@ -521,6 +521,7 @@ class RealCaptureThread(QThread):
         if self._binary_model is not None:
             try:
                 prediction = self._binary_model.predict(feature_array)[0]
+                print("Prediction:", prediction)
                 if hasattr(self._binary_model, "predict_proba"):
                     probas = self._binary_model.predict_proba(feature_array)[0]
                     confidence = float(max(probas))
@@ -759,16 +760,19 @@ class RealCaptureThread(QThread):
             total_bytes = sum(flow_rec.fwd_lengths) + sum(flow_rec.bwd_lengths)
             flow_duration = flow_rec.last_time - flow_rec.start_time
             thresholds = self._thresholds()
-
+            print("FLOW READY")
+            print("Packets:", total_pkts)
+            print("Bytes:", total_bytes)
+            print("Duration:", flow_duration)
             if flow_rec.protocol not in (6, 17):
                 return
 
                                                
-            min_pkts = 1 if flow_rec.protocol == 6 else 6
+            min_pkts = 1
             if total_pkts < min_pkts:
                 return
-            if flow_rec.protocol == 17 and total_bytes < 220:
-                return
+            # if flow_rec.protocol == 17 and total_bytes < 220:
+            #     return
 
                                                                                   
                                                                                                 
@@ -901,8 +905,10 @@ class RealCaptureThread(QThread):
 
             if self._binary_model is None:
                 return
+            print("STAGE 1 RUNNING")
 
             pred = self._binary_model.predict(X)[0]
+            print("Prediction:", pred)
             s1_confidence = 0.80
             if hasattr(self._binary_model, "predict_proba"):
                 s1_confidence = float(max(self._binary_model.predict_proba(X)[0]))
