@@ -889,6 +889,19 @@ class RealCaptureThread(QThread):
                 return
 
             X = feature_vec.reshape(1, -1)
+            
+            import pandas as pd
+            import os
+
+            df = pd.DataFrame([feature_vec], columns=self._feature_names)
+            csv_file = "runtime_flows.csv"
+            df.to_csv(
+                csv_file,
+                mode="a",
+                header=not os.path.exists(csv_file),
+                index=False
+            )            
+            
             if self._scaler is not None:
                 try:
                     scaler_input = X
