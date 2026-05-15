@@ -15,7 +15,7 @@ FLOW_TIMEOUT = 3.0
                                                    
 MAX_FLOW_PACKETS = 200
                                                       
-MIN_FLOW_PACKETS = 2                                                 
+MIN_FLOW_PACKETS = 1                                                 
 
 @dataclass
 class FlowRecord:

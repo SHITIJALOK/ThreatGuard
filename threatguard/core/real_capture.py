@@ -147,6 +147,7 @@ class RealCaptureThread(QThread):
         self._running = False
         self._blocked_ips: set[str] = set()
         self._reported_block_failures: set[str] = set()
+        self._error_report_timestamps: dict[str, float] = {}
         self._source_activity_lock = threading.Lock()
         self._source_activity = defaultdict(
             lambda: {
@@ -163,6 +164,16 @@ class RealCaptureThread(QThread):
         self._scaler = None
         self._attack_label_encoder = None
         self._feature_names: list[str] = []
+
+    def _report_runtime_issue(self, area: str, exc: Exception, min_interval_sec: float = 8.0):
+        msg = f"{area}: {type(exc).__name__}: {exc}"
+        now = time.time()
+        last_seen = self._error_report_timestamps.get(msg, 0.0)
+        if now - last_seen < min_interval_sec:
+            return
+        self._error_report_timestamps[msg] = now
+        self.capture_error.emit(msg)
+        print(f"[RealCapture] {msg}")
 
     @staticmethod
     def _prediction_is_attack(prediction) -> bool:
@@ -182,11 +193,11 @@ class RealCaptureThread(QThread):
         self._sensitivity_profile = profile
 
     def _thresholds(self) -> dict[str, float]:
-        return{
-        "stage1": 0.40,
-        "stage2": 0.30,
-        "block": 0.40
-    }
+        if self._test_mode or self._sensitivity_profile == "Aggressive":
+            return {"stage1": 0.45, "stage2": 0.35, "block": 0.50}
+        if self._sensitivity_profile == "Strict":
+            return {"stage1": 0.85, "stage2": 0.80, "block": 0.90}
+        return {"stage1": 0.65, "stage2": 0.70, "block": 0.85}
     
     def set_binary_model(self, path: str):
         self._binary_model_path = path
@@ -703,8 +714,8 @@ class RealCaptureThread(QThread):
                     try:
                         for _, feature_vec, flow_rec in self._flow_agg.get_expired_flows():
                             self._classify_and_emit_flow(flow_rec, feature_vec)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        self._report_runtime_issue("expired-flow-check", exc)
                     time.sleep(0.8)
 
             import threading
@@ -729,8 +740,8 @@ class RealCaptureThread(QThread):
                     if result:
                         _, feature_vec, flow_rec = result
                         self._classify_and_emit_flow(flow_rec, feature_vec)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._report_runtime_issue("packet-processing", exc)
 
             sniff(
                 iface=resolved_iface,
@@ -760,19 +771,35 @@ class RealCaptureThread(QThread):
             total_bytes = sum(flow_rec.fwd_lengths) + sum(flow_rec.bwd_lengths)
             flow_duration = flow_rec.last_time - flow_rec.start_time
             thresholds = self._thresholds()
-            print("FLOW READY")
-            print("Packets:", total_pkts)
-            print("Bytes:", total_bytes)
-            print("Duration:", flow_duration)
             if flow_rec.protocol not in (6, 17):
                 return
 
-                                               
-            min_pkts = 1
+            # Require stronger evidence for live-mode ML classification to reduce false positives
+            # on tiny normal HTTPS/TCP bursts; keep scan-style SYN-only flows detectable.
+            if flow_rec.protocol == 6:
+                if (
+                    flow_rec.syn_count >= 1
+                    and flow_rec.ack_count == 0
+                    and flow_duration <= 3.0
+                ):
+                    min_pkts = 1
+                    min_bytes = 0
+                elif self._test_mode:
+                    min_pkts = 1
+                    min_bytes = 0
+                elif flow_rec.dst_port == 443:
+                    min_pkts = 6
+                    min_bytes = 280
+                else:
+                    min_pkts = 4
+                    min_bytes = 220
+            else:
+                min_pkts = 6 if self._test_mode else 8
+                min_bytes = 220 if self._test_mode else 320
             if total_pkts < min_pkts:
                 return
-            # if flow_rec.protocol == 17 and total_bytes < 220:
-            #     return
+            if total_bytes < min_bytes:
+                return
 
                                                                                   
                                                                                                 
@@ -889,19 +916,6 @@ class RealCaptureThread(QThread):
                 return
 
             X = feature_vec.reshape(1, -1)
-            
-            import pandas as pd
-            import os
-
-            df = pd.DataFrame([feature_vec], columns=self._feature_names)
-            csv_file = "runtime_flows.csv"
-            df.to_csv(
-                csv_file,
-                mode="a",
-                header=not os.path.exists(csv_file),
-                index=False
-            )            
-            
             if self._scaler is not None:
                 try:
                     scaler_input = X
@@ -918,10 +932,8 @@ class RealCaptureThread(QThread):
 
             if self._binary_model is None:
                 return
-            print("STAGE 1 RUNNING")
 
             pred = self._binary_model.predict(X)[0]
-            print("Prediction:", pred)
             s1_confidence = 0.80
             if hasattr(self._binary_model, "predict_proba"):
                 s1_confidence = float(max(self._binary_model.predict_proba(X)[0]))
@@ -935,6 +947,7 @@ class RealCaptureThread(QThread):
             confidence = s1_confidence
             stage2_label = "Unknown"
             stage2_confidence = 0.0
+            detection_source = "stage1_only"
 
             if self._attack_model is not None:
                 try:
@@ -959,6 +972,7 @@ class RealCaptureThread(QThread):
                         if mapped is not None:
                             threat_type = mapped
                             confidence = s2_confidence
+                            detection_source = "stage2_mapped"
                 except Exception:
                     pass
 
@@ -981,15 +995,20 @@ class RealCaptureThread(QThread):
                     if scan_assist == ThreatType.PORT_SCAN:
                         threat_type = ThreatType.PORT_SCAN
                         confidence = max(confidence, 0.92)
+                        detection_source = "signature_scan_assist"
 
-                                                                                        
-                                                                               
                 if not self._test_mode and threat_type is None:
-                    # Keep ML detection alive even when stage-2 class names
-                    # do not map exactly to local ThreatType labels.
-                    if is_malicious and s1_confidence >= max(0.80, s1_min_conf):
+                    # Live mode policy: drop weak/unconfirmed stage-1-only predictions.
+                    # Keep a very strict fallback path for high-confidence sustained flows.
+                    if (
+                        is_malicious
+                        and s1_confidence >= max(0.985, s1_min_conf + 0.20)
+                        and total_pkts >= 16
+                        and total_bytes >= 1500
+                    ):
                         threat_type = ThreatType.MALWARE_COMM
                         confidence = max(confidence, s1_confidence)
+                        detection_source = "stage1_high_conf_fallback"
                     else:
                         return
                 if threat_type is None:
@@ -997,6 +1016,7 @@ class RealCaptureThread(QThread):
                     if threat_type is None:
                         return
                     confidence = max(confidence, 0.80)
+                    detection_source = "heuristic_fallback"
 
             should_block = False
             block_reason = ""
@@ -1007,11 +1027,16 @@ class RealCaptureThread(QThread):
                 f"Stage1={s1_confidence:.0%} (pred={pred}), "
                 f"Stage2={stage2_label} ({stage2_confidence:.0%}), "
                 f"Profile={self._sensitivity_profile}, "
+                f"Source={detection_source}, "
                 f"flow={total_pkts} pkts/{total_bytes} bytes/{pps:.1f} pps, "
                 f"SYN ratio={syn_ratio:.0%}"
             )
-
-            if self._prevention_enabled and confidence >= block_min_conf:
+            confirmed_for_block = detection_source in {
+                "stage2_mapped",
+                "signature_scan_assist",
+                "heuristic_fallback",
+            }
+            if self._prevention_enabled and confidence >= block_min_conf and confirmed_for_block:
                 blocked, reason = self._ensure_firewall_block(flow_rec.src_ip, threat_type)
                 should_block = blocked
                 block_reason = (
@@ -1062,5 +1087,5 @@ class RealCaptureThread(QThread):
                 block_reason=block_reason,
             )
             self.packet_captured.emit(alert_packet)
-        except Exception:
-            pass
+        except Exception as exc:
+            self._report_runtime_issue("flow-classification", exc)
