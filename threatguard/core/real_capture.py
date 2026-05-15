@@ -11,6 +11,7 @@ import subprocess
 import time
 import traceback
 import threading
+import warnings
 from collections import defaultdict, deque
 from datetime import datetime
 from typing import Optional
@@ -20,6 +21,12 @@ from PySide6.QtCore import QThread, Signal
 from threatguard.core.packet import Packet, Protocol, ThreatType
 from threatguard.core.flow_aggregator import FlowAggregator, FlowRecord
 from threatguard.utils.ip_manager import is_ip_allowed, queue_block_ip
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"`sklearn\.utils\.parallel\.delayed` should be used with `sklearn\.utils\.parallel\.Parallel`.*",
+    category=UserWarning,
+)
 
                                                    
 PORT_PROTOCOL_MAP = {
@@ -198,6 +205,26 @@ class RealCaptureThread(QThread):
         if self._sensitivity_profile == "Strict":
             return {"stage1": 0.85, "stage2": 0.80, "block": 0.90}
         return {"stage1": 0.65, "stage2": 0.70, "block": 0.85}
+
+    def _stage2_min_conf_for_threat(self, threat_type: ThreatType, default_s2: float) -> float:
+        if self._test_mode:
+            return default_s2
+        if threat_type == ThreatType.PORT_SCAN:
+            return 0.70
+        if threat_type in {ThreatType.DOS_ATTACK, ThreatType.DDOS_ATTACK}:
+            return 0.40
+        if threat_type == ThreatType.BRUTE_FORCE:
+            return 0.75
+        return default_s2
+
+    def _is_bruteforce_flow_plausible(self, flow_rec: FlowRecord, total_pkts: int, total_bytes: int) -> bool:
+        auth_ports = {21, 22, 23, 25, 110, 143, 389, 445, 587, 993, 995, 1433, 3306, 3389, 5432, 5900}
+        web_ports = {80, 443, 8080, 8443}
+        if flow_rec.dst_port in auth_ports:
+            return total_pkts >= 6
+        if flow_rec.dst_port in web_ports:
+            return total_pkts >= 28 and total_bytes >= 3200
+        return False
     
     def set_binary_model(self, path: str):
         self._binary_model_path = path
@@ -854,14 +881,12 @@ class RealCaptureThread(QThread):
 
                                                        
                                                                                              
-            signature_threat = None
-            if self._test_mode:
-                signature_threat = self._detect_signature_threat(
-                    flow_rec=flow_rec,
-                    total_pkts=total_pkts,
-                    total_bytes=total_bytes,
-                    flow_duration=flow_duration,
-                )
+            signature_threat = self._detect_signature_threat(
+                flow_rec=flow_rec,
+                total_pkts=total_pkts,
+                total_bytes=total_bytes,
+                flow_duration=flow_duration,
+            )
 
             if signature_threat is not None:
                 threat_type = signature_threat
@@ -966,12 +991,22 @@ class RealCaptureThread(QThread):
 
                     stage2_label = str(label)
                     stage2_confidence = s2_confidence
-                    s2_min_conf = thresholds["stage2"]
-                    if s2_confidence >= s2_min_conf:
-                        mapped = _map_attack_label(str(label))
-                        if mapped is not None:
+                    mapped = _map_attack_label(str(label))
+                    if mapped is not None:
+                        s2_min_conf = self._stage2_min_conf_for_threat(mapped, thresholds["stage2"])
+                        if mapped == ThreatType.BRUTE_FORCE and not self._is_bruteforce_flow_plausible(
+                            flow_rec, total_pkts, total_bytes
+                        ):
+                            mapped = None
+                        ddos_relaxed = (
+                            mapped in {ThreatType.DOS_ATTACK, ThreatType.DDOS_ATTACK}
+                            and s1_confidence >= 0.90
+                            and s2_confidence >= 0.35
+                            and total_pkts >= 10
+                        )
+                        if mapped is not None and (s2_confidence >= s2_min_conf or ddos_relaxed):
                             threat_type = mapped
-                            confidence = s2_confidence
+                            confidence = max(s2_confidence, s1_confidence if ddos_relaxed else s2_confidence)
                             detection_source = "stage2_mapped"
                 except Exception:
                     pass
