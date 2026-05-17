@@ -34,7 +34,7 @@ SEVERITY_COLORS = {
 class TrafficTableModel(QAbstractTableModel):
     
 
-    COLUMNS = ["#", "Time", "Source", "Destination", "Protocol", "Length", "Info", "Status"]
+    COLUMNS = ["#", "Time", "Source", "Destination", "Protocol", "Length", "Status"]
 
     def __init__(self, max_rows: int = 10000, parent=None):
         super().__init__(parent)
@@ -151,8 +151,6 @@ class TrafficTableModel(QAbstractTableModel):
         if col == 5:
             return str(packet.length)
         if col == 6:
-            return packet.info_text
-        if col == 7:
             return packet.status_text
         return ""
 

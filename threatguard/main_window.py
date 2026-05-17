@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
+import time
 
-from PySide6.QtCore import Qt, QSize, QEvent, QModelIndex
+from PySide6.QtCore import Qt, QSize, QEvent, QModelIndex, QTimer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QSplitter, QMessageBox, QMenuBar, QMenu,
@@ -46,6 +47,12 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app:
             app.installEventFilter(self)
+        self._packet_buffer: list[Packet] = []
+        self._last_packet_flush = 0.0
+        self._packet_flush_timer = QTimer(self)
+        self._packet_flush_timer.setInterval(80)
+        self._packet_flush_timer.timeout.connect(self._flush_packet_buffer)
+        self._packet_flush_timer.start()
 
                                                                 
                
@@ -309,7 +316,10 @@ class MainWindow(QMainWindow):
         self.traffic_table.set_live(state in (EngineState.RUNNING, EngineState.DISABLED))
 
     def _on_packet_received(self, packet: Packet):
-        self.traffic_table.add_packet(packet)
+        self._packet_buffer.append(packet)
+        now = time.monotonic()
+        if packet.is_malicious or len(self._packet_buffer) >= 60 or (now - self._last_packet_flush) >= 0.10:
+            self._flush_packet_buffer()
 
     def _on_packet_blocked(self, packet: Packet):
         self.blocked_table.add_packet(packet)
@@ -321,6 +331,14 @@ class MainWindow(QMainWindow):
     def _on_stats_updated(self, stats: dict):
         self.sidebar.update_stats(stats)
         self.idps_status_bar.update_stats(stats)
+
+    def _flush_packet_buffer(self):
+        if not self._packet_buffer:
+            return
+        batch = self._packet_buffer
+        self._packet_buffer = []
+        self.traffic_table.add_packets(batch)
+        self._last_packet_flush = time.monotonic()
 
     def _on_capture_error(self, error_msg: str):
         self.sidebar.log(f"CAPTURE ERROR: {error_msg}", "ERROR")

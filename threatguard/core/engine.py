@@ -61,8 +61,10 @@ class IDPSEngine(QObject):
         self._binary_model_path: Optional[str] = None
         self._attack_model_path: Optional[str] = None
         self._scaler_path: Optional[str] = None
+        self._attack_scaler_path: Optional[str] = None
         self._label_encoder_path: Optional[str] = None
         self._feature_names_path: Optional[str] = None
+        self._attack_feature_names_path: Optional[str] = None
 
                                             
         self._interface: Optional[str] = None
@@ -73,6 +75,8 @@ class IDPSEngine(QObject):
         self._blocked_packets = 0
         self._blocked_alert_window_seconds = 15.0
         self._last_block_alert_time: dict[tuple[str, str], float] = {}
+        self._last_stats_emit_time = 0.0
+        self._stats_emit_interval_sec = 0.20
 
                                       
         self._auto_load_models()
@@ -163,8 +167,10 @@ class IDPSEngine(QObject):
                 binary_model_path=self._binary_model_path,
                 attack_model_path=self._attack_model_path,
                 scaler_path=self._scaler_path,
+                attack_scaler_path=self._attack_scaler_path,
                 label_encoder_path=self._label_encoder_path,
                 feature_names_path=self._feature_names_path,
+                attack_feature_names_path=self._attack_feature_names_path,
                 model_name=self._current_model,
                 sensitivity_profile=self._sensitivity_profile,
                 test_mode=self._test_mode,
@@ -259,6 +265,11 @@ class IDPSEngine(QObject):
                 if os.path.isfile(scaler):
                     self._scaler_path = scaler
 
+            if self._attack_scaler_path is None:
+                attack_scaler = os.path.join(model_dir, "stage2_scaler.pkl")
+                if os.path.isfile(attack_scaler):
+                    self._attack_scaler_path = attack_scaler
+
             if self._label_encoder_path is None:
                 label_encoder = os.path.join(model_dir, "label_encoder.pkl")
                 if os.path.isfile(label_encoder):
@@ -268,6 +279,16 @@ class IDPSEngine(QObject):
                 feature_names = os.path.join(model_dir, "feature_names.pkl")
                 if os.path.isfile(feature_names):
                     self._feature_names_path = feature_names
+
+            if self._attack_feature_names_path is None:
+                attack_features = os.path.join(model_dir, "stage2_features.pkl")
+                if os.path.isfile(attack_features):
+                    self._attack_feature_names_path = attack_features
+
+        if self._attack_scaler_path is None:
+            self._attack_scaler_path = self._scaler_path
+        if self._attack_feature_names_path is None:
+            self._attack_feature_names_path = self._feature_names_path
 
     def _set_state(self, state: EngineState):
         self._state = state
@@ -286,7 +307,10 @@ class IDPSEngine(QObject):
                 self.packet_blocked.emit(packet)
 
         self.packet_received.emit(packet)
-        self.stats_updated.emit(self.stats)
+        now = time.monotonic()
+        if (now - self._last_stats_emit_time) >= self._stats_emit_interval_sec:
+            self._last_stats_emit_time = now
+            self.stats_updated.emit(self.stats)
 
     def _should_emit_block_alert(self, packet: Packet) -> bool:
         

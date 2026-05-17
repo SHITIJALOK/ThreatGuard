@@ -82,7 +82,6 @@ class TrafficTableWidget(QFrame):
         header_view.setSectionResizeMode(4, QHeaderView.ResizeToContents)            
         header_view.setSectionResizeMode(5, QHeaderView.ResizeToContents)          
         header_view.setSectionResizeMode(6, QHeaderView.Stretch)                 
-        header_view.setSectionResizeMode(7, QHeaderView.ResizeToContents)          
 
                     
         self.table_view.verticalHeader().setDefaultSectionSize(28)
@@ -109,6 +108,22 @@ class TrafficTableWidget(QFrame):
         self.count_label.setText(f"{count:,} packets")
 
                                                             
+        sb = self.table_view.verticalScrollBar()
+        at_bottom = sb.value() >= sb.maximum() - 3
+        if at_bottom:
+            self.table_view.scrollToBottom()
+
+    def add_packets(self, packets: list[Packet]):
+        if not packets:
+            return
+        self.table_view.setUpdatesEnabled(False)
+        try:
+            for packet in packets:
+                self._model.add_packet(packet)
+        finally:
+            self.table_view.setUpdatesEnabled(True)
+        count = self._model.rowCount()
+        self.count_label.setText(f"{count:,} packets")
         sb = self.table_view.verticalScrollBar()
         at_bottom = sb.value() >= sb.maximum() - 3
         if at_bottom:

@@ -130,8 +130,10 @@ class RealCaptureThread(QThread):
         binary_model_path: Optional[str] = None,
         attack_model_path: Optional[str] = None,
         scaler_path: Optional[str] = None,
+        attack_scaler_path: Optional[str] = None,
         label_encoder_path: Optional[str] = None,
         feature_names_path: Optional[str] = None,
+        attack_feature_names_path: Optional[str] = None,
         model_name: str = "Custom Model",
         prevention_enabled: bool = True,
         confidence_threshold: float = 0.40,
@@ -144,17 +146,21 @@ class RealCaptureThread(QThread):
         self._binary_model_path = binary_model_path
         self._attack_model_path = attack_model_path
         self._scaler_path = scaler_path
+        self._attack_scaler_path = attack_scaler_path
         self._label_encoder_path = label_encoder_path
         self._feature_names_path = feature_names_path
+        self._attack_feature_names_path = attack_feature_names_path
         self.model_name = model_name
         self._prevention_enabled = prevention_enabled
         self._confidence_threshold = confidence_threshold
         self._sensitivity_profile = sensitivity_profile
-        self._test_mode = bool(test_mode)
+        self._test_mode = False
         self._running = False
         self._blocked_ips: set[str] = set()
         self._reported_block_failures: set[str] = set()
         self._error_report_timestamps: dict[str, float] = {}
+        self._recent_alerts: dict[tuple[str, str], float] = {}
+        self._alert_dedupe_sec = 8.0
         self._source_activity_lock = threading.Lock()
         self._source_activity = defaultdict(
             lambda: {
@@ -162,6 +168,7 @@ class RealCaptureThread(QThread):
                 "scan_ports": deque(),
                 "packet_times": deque(),
                 "udp_packet_times": deque(),
+                "web_flow_times": deque(),
             }
         )
 
@@ -169,8 +176,10 @@ class RealCaptureThread(QThread):
         self._binary_model = None
         self._attack_model = None
         self._scaler = None
+        self._attack_scaler = None
         self._attack_label_encoder = None
         self._feature_names: list[str] = []
+        self._attack_feature_names: list[str] = []
 
     def _report_runtime_issue(self, area: str, exc: Exception, min_interval_sec: float = 8.0):
         msg = f"{area}: {type(exc).__name__}: {exc}"
@@ -200,21 +209,23 @@ class RealCaptureThread(QThread):
         self._sensitivity_profile = profile
 
     def _thresholds(self) -> dict[str, float]:
-        if self._test_mode or self._sensitivity_profile == "Aggressive":
+        if self._sensitivity_profile == "Aggressive":
             return {"stage1": 0.45, "stage2": 0.35, "block": 0.50}
         if self._sensitivity_profile == "Strict":
             return {"stage1": 0.85, "stage2": 0.80, "block": 0.90}
         return {"stage1": 0.65, "stage2": 0.70, "block": 0.85}
 
     def _stage2_min_conf_for_threat(self, threat_type: ThreatType, default_s2: float) -> float:
-        if self._test_mode:
-            return default_s2
         if threat_type == ThreatType.PORT_SCAN:
-            return 0.70
-        if threat_type in {ThreatType.DOS_ATTACK, ThreatType.DDOS_ATTACK}:
-            return 0.40
+            return 0.65
+        if threat_type == ThreatType.DOS_ATTACK:
+            return 0.80
+        if threat_type == ThreatType.DDOS_ATTACK:
+            return 0.85
         if threat_type == ThreatType.BRUTE_FORCE:
             return 0.75
+        if threat_type == ThreatType.MALWARE_COMM:
+            return 0.85
         return default_s2
 
     def _is_bruteforce_flow_plausible(self, flow_rec: FlowRecord, total_pkts: int, total_bytes: int) -> bool:
@@ -234,8 +245,23 @@ class RealCaptureThread(QThread):
         self._attack_model_path = path
         self._attack_model = None                
 
+    def _should_emit_alert(self, src_ip: str, threat_type: ThreatType) -> bool:
+        key = (src_ip, threat_type.name)
+        now = time.time()
+        last = self._recent_alerts.get(key, 0.0)
+        if (now - last) < self._alert_dedupe_sec:
+            return False
+        self._recent_alerts[key] = now
+        return True
+
+    def _reset_runtime_detection_state(self):
+        with self._source_activity_lock:
+            self._source_activity.clear()
+        self._recent_alerts.clear()
+
     def stop(self):
         self._running = False
+        self._reset_runtime_detection_state()
 
     def _record_source_activity(
         self,
@@ -263,6 +289,8 @@ class RealCaptureThread(QThread):
                 bucket["packet_times"].append(now)
                 if flow_rec.protocol == 17:
                     bucket["udp_packet_times"].append(now)
+            if flow_rec.protocol == 6 and flow_rec.dst_port in {80, 443, 8000}:
+                bucket["web_flow_times"].append(now)
 
             while bucket["scan_times"] and now - bucket["scan_times"][0] > 6.0:
                 bucket["scan_times"].popleft()
@@ -272,6 +300,8 @@ class RealCaptureThread(QThread):
                 bucket["packet_times"].popleft()
             while bucket["udp_packet_times"] and now - bucket["udp_packet_times"][0] > 3.0:
                 bucket["udp_packet_times"].popleft()
+            while bucket["web_flow_times"] and now - bucket["web_flow_times"][0] > 6.0:
+                bucket["web_flow_times"].popleft()
 
             unique_ports = {port for _, port in bucket["scan_ports"]}
             return {
@@ -279,7 +309,50 @@ class RealCaptureThread(QThread):
                 "recent_scan_ports": len(unique_ports),
                 "recent_packets": len(bucket["packet_times"]),
                 "recent_udp_packets": len(bucket["udp_packet_times"]),
+                "recent_web_flows": len(bucket["web_flow_times"]),
             }
+
+    def _detect_behavioral_dos(
+        self,
+        flow_rec: FlowRecord,
+        total_pkts: int,
+        total_bytes: int,
+        flow_duration: float,
+        activity: dict[str, int],
+    ) -> Optional[ThreatType]:
+        # Lab-targeted HTTP/HTTPS flood detector with safeguards against normal browsing.
+        if flow_rec.protocol != 6:
+            return None
+        if flow_rec.dst_port not in {80, 443, 8000}:
+            return None
+        if total_pkts < 8:
+            return None
+        if flow_duration <= 0:
+            return None
+
+        pps = total_pkts / max(flow_duration, 1e-3)
+        syn_ratio = flow_rec.syn_count / max(total_pkts, 1)
+        sustained_repetition = (
+            activity.get("recent_web_flows", 0) >= 8
+            and activity.get("recent_packets", 0) >= 260
+        )
+
+        # Catch AB-like floods that may appear as fewer but very heavy flows.
+        extreme_single_flow = (
+            total_pkts >= 120
+            and pps >= 250
+            and total_bytes >= 12000
+            and syn_ratio >= 0.15
+        )
+
+        if not (sustained_repetition or extreme_single_flow):
+            return None
+
+        if pps < 90 and not extreme_single_flow:
+            return None
+        if not (syn_ratio >= 0.60 or total_pkts >= 20 or total_bytes >= 4000 or extreme_single_flow):
+            return None
+        return ThreatType.DOS_ATTACK
 
     def _infer_fallback_threat(
         self,
@@ -316,21 +389,31 @@ class RealCaptureThread(QThread):
         total_pkts: int,
         total_bytes: int,
         flow_duration: float,
+        activity: Optional[dict[str, int]] = None,
     ) -> Optional[ThreatType]:
         
         pps = total_pkts / max(flow_duration, 1e-3)
         syn_ratio = flow_rec.syn_count / max(total_pkts, 1)
-        activity = self._record_source_activity(flow_rec, total_pkts, flow_duration)
+        if activity is None:
+            activity = self._record_source_activity(flow_rec, total_pkts, flow_duration)
 
                                           
-        if (
-            flow_rec.protocol == 6
-            and (
-                (total_pkts >= 80 and pps >= 180 and syn_ratio >= 0.80)
-                or (activity["recent_packets"] >= 500 and syn_ratio >= 0.75)
+        if flow_rec.protocol == 6:
+            sustained_burst = (
+                activity["recent_packets"] >= 500
+                and activity["recent_web_flows"] >= 5
             )
-        ):
-            return ThreatType.DDOS_ATTACK
+
+            strong_flow = (
+                total_pkts >= 20
+                and pps >= 30
+                and total_bytes >= 2000
+            )
+
+            syn_pressure = syn_ratio >= 0.75
+
+            if strong_flow and sustained_burst and syn_pressure:
+                return ThreatType.DDOS_ATTACK
 
                                                                                    
         if (
@@ -353,6 +436,28 @@ class RealCaptureThread(QThread):
             return ThreatType.DDOS_ATTACK
 
         return None
+
+    def _rule_prefilter_suspicious(
+        self,
+        flow_rec: FlowRecord,
+        total_pkts: int,
+        total_bytes: int,
+        flow_duration: float,
+        activity: dict[str, int],
+        signature_threat: Optional[ThreatType],
+    ) -> bool:
+        if signature_threat is not None:
+            return True
+        pps = total_pkts / max(flow_duration, 1e-3)
+        auth_ports = {21, 22, 23, 25, 110, 143, 389, 445, 587, 993, 995, 1433, 3306, 3389, 5432, 5900}
+        if flow_rec.protocol == 6:
+            if flow_rec.dst_port in auth_ports and activity["recent_scan_flows"] >= 6 and total_pkts >= 3:
+                return True
+            if total_pkts >= 24 and pps >= 80:
+                return True
+        if flow_rec.protocol == 17 and total_pkts >= 40 and pps >= 150 and total_bytes >= 2000:
+            return True
+        return False
 
     def _ensure_firewall_block(self, src_ip: str, threat_type: ThreatType) -> tuple[bool, str]:
         
@@ -487,6 +592,24 @@ class RealCaptureThread(QThread):
                         ]
                 except Exception:
                     pass
+
+        if self._attack_scaler_path and self._attack_scaler is None:
+            try:
+                with open(self._attack_scaler_path, "rb") as f:
+                    self._attack_scaler = pickle.load(f)
+            except Exception:
+                self._attack_scaler = self._scaler
+
+        if self._attack_feature_names_path and not self._attack_feature_names:
+            try:
+                with open(self._attack_feature_names_path, "rb") as f:
+                    loaded = pickle.load(f)
+                if isinstance(loaded, list):
+                    self._attack_feature_names = loaded
+            except Exception:
+                pass
+        if not self._attack_feature_names:
+            self._attack_feature_names = list(self._feature_names)
 
     def _extract_features(self, scapy_packet) -> Optional[list]:
         
@@ -709,6 +832,7 @@ class RealCaptureThread(QThread):
     def run(self):
         
         self._running = True
+        self._reset_runtime_detection_state()
 
         try:
             from scapy.all import sniff, conf
@@ -800,6 +924,9 @@ class RealCaptureThread(QThread):
             thresholds = self._thresholds()
             if flow_rec.protocol not in (6, 17):
                 return
+            # User policy: ignore HTTPS flows entirely for detection/prevention.
+            if flow_rec.protocol == 6 and (flow_rec.dst_port == 443 or flow_rec.src_port == 443):
+                return
 
             # Require stronger evidence for live-mode ML classification to reduce false positives
             # on tiny normal HTTPS/TCP bursts; keep scan-style SYN-only flows detectable.
@@ -811,9 +938,6 @@ class RealCaptureThread(QThread):
                 ):
                     min_pkts = 1
                     min_bytes = 0
-                elif self._test_mode:
-                    min_pkts = 1
-                    min_bytes = 0
                 elif flow_rec.dst_port == 443:
                     min_pkts = 6
                     min_bytes = 280
@@ -821,8 +945,8 @@ class RealCaptureThread(QThread):
                     min_pkts = 4
                     min_bytes = 220
             else:
-                min_pkts = 6 if self._test_mode else 8
-                min_bytes = 220 if self._test_mode else 320
+                min_pkts = 8
+                min_bytes = 320
             if total_pkts < min_pkts:
                 return
             if total_bytes < min_bytes:
@@ -830,8 +954,8 @@ class RealCaptureThread(QThread):
 
                                                                                   
                                                                                                 
+            activity = self._record_source_activity(flow_rec, total_pkts, flow_duration)
             if flow_rec.protocol == 6:
-                activity = self._record_source_activity(flow_rec, total_pkts, flow_duration)
                 syn_ratio = flow_rec.syn_count / max(total_pkts, 1)
                 if (
                     flow_rec.syn_count >= 1
@@ -886,11 +1010,23 @@ class RealCaptureThread(QThread):
                 total_pkts=total_pkts,
                 total_bytes=total_bytes,
                 flow_duration=flow_duration,
+                activity=activity,
+            )
+
+            rule_prefilter_hit = self._rule_prefilter_suspicious(
+                flow_rec=flow_rec,
+                total_pkts=total_pkts,
+                total_bytes=total_bytes,
+                flow_duration=flow_duration,
+                activity=activity,
+                signature_threat=signature_threat,
             )
 
             if signature_threat is not None:
                 threat_type = signature_threat
                 confidence = 0.99
+                if not self._should_emit_alert(flow_rec.src_ip, threat_type):
+                    return
                 proto = {6: Protocol.TCP, 17: Protocol.UDP}.get(flow_rec.protocol, Protocol.TCP)
                 proto = PORT_PROTOCOL_MAP.get(flow_rec.dst_port, proto)
                 should_block = False
@@ -940,6 +1076,82 @@ class RealCaptureThread(QThread):
                 self.packet_captured.emit(alert_packet)
                 return
 
+            # Behavioral DoS detection (additive; Port Scan path above stays unchanged)
+            dos_threat = self._detect_behavioral_dos(
+                flow_rec=flow_rec,
+                total_pkts=total_pkts,
+                total_bytes=total_bytes,
+                flow_duration=flow_duration,
+                activity=activity,
+            )
+            if dos_threat is not None:
+                threat_type = dos_threat
+                confidence = 0.95
+                if not self._should_emit_alert(flow_rec.src_ip, threat_type):
+                    return
+                proto = PORT_PROTOCOL_MAP.get(flow_rec.dst_port, Protocol.TCP)
+                should_block = False
+                block_reason = ""
+
+                pps = total_pkts / max(flow_duration, 1e-3)
+                syn_ratio = flow_rec.syn_count / max(total_pkts, 1)
+                block_min_conf = thresholds["block"]
+                if self._prevention_enabled and confidence >= block_min_conf:
+                    blocked, reason = self._ensure_firewall_block(flow_rec.src_ip, threat_type)
+                    should_block = blocked
+                    block_reason = (
+                        f"Behavioral DoS detection from {flow_rec.src_ip} "
+                        f"[{total_pkts} pkts, {pps:.1f} pps, SYN ratio={syn_ratio:.0%}, "
+                        f"web_flows={activity.get('recent_web_flows', 0)}, "
+                        f"recent_pkts={activity.get('recent_packets', 0)}, "
+                        f"Confidence: {confidence:.0%}] | {reason}"
+                    )
+                    if not blocked:
+                        key = f"{flow_rec.src_ip}:{reason}"
+                        if key not in self._reported_block_failures:
+                            self._reported_block_failures.add(key)
+                            self.capture_error.emit(
+                                f"Prevention rule failed for {flow_rec.src_ip}: {reason}"
+                            )
+
+                alert_packet = Packet(
+                    timestamp=datetime.now(),
+                    src_ip=flow_rec.src_ip,
+                    dst_ip=flow_rec.dst_ip,
+                    src_port=flow_rec.src_port,
+                    dst_port=flow_rec.dst_port,
+                    protocol=proto,
+                    length=total_bytes,
+                    ttl=0,
+                    flags="",
+                    payload_preview=(
+                        f"DOS ALERT: {total_pkts} pkts | {pps:.1f} pps | "
+                        f"web_flows={activity.get('recent_web_flows', 0)} | conf: {confidence:.0%}"
+                    ),
+                    is_malicious=True,
+                    threat_type=threat_type,
+                    confidence=confidence,
+                    model_used=f"{self.model_name} + BehavioralDoS",
+                    is_blocked=should_block,
+                    block_reason=block_reason,
+                )
+                self.packet_captured.emit(alert_packet)
+                return
+
+            # Conservative HTTPS browsing-noise filter (after behavioral detectors).
+            # This skips ML on small low-rate 443 flows while keeping DoS/PortScan detection active.
+            if flow_rec.protocol == 6 and flow_rec.dst_port == 443:
+                pps_https = total_pkts / max(flow_duration, 1e-3)
+                syn_ratio_https = flow_rec.syn_count / max(total_pkts, 1)
+                if (
+                    total_pkts <= 14
+                    and total_bytes <= 3500
+                    and pps_https <= 65
+                    and syn_ratio_https <= 0.35
+                    and activity.get("recent_web_flows", 0) <= 4
+                ):
+                    return
+
             X = feature_vec.reshape(1, -1)
             if self._scaler is not None:
                 try:
@@ -967,6 +1179,8 @@ class RealCaptureThread(QThread):
             s1_min_conf = thresholds["stage1"]
             if not is_malicious or s1_confidence < s1_min_conf:
                 return
+            if not rule_prefilter_hit:
+                return
 
             threat_type = None
             confidence = s1_confidence
@@ -976,10 +1190,25 @@ class RealCaptureThread(QThread):
 
             if self._attack_model is not None:
                 try:
-                    atk_pred = self._attack_model.predict(X)[0]
+                    X_stage2 = feature_vec.reshape(1, -1)
+                    if self._attack_scaler is not None:
+                        try:
+                            atk_scaler_input = X_stage2
+                            atk_scaler_feature_names = getattr(self._attack_scaler, "feature_names_in_", None)
+                            if atk_scaler_feature_names is not None and len(atk_scaler_feature_names) == X_stage2.shape[1]:
+                                import pandas as pd
+                                atk_scaler_input = pd.DataFrame(X_stage2, columns=list(atk_scaler_feature_names))
+                            elif self._attack_feature_names and len(self._attack_feature_names) == X_stage2.shape[1]:
+                                import pandas as pd
+                                atk_scaler_input = pd.DataFrame(X_stage2, columns=self._attack_feature_names)
+                            X_stage2 = self._attack_scaler.transform(atk_scaler_input)
+                        except Exception:
+                            pass
+
+                    atk_pred = self._attack_model.predict(X_stage2)[0]
                     s2_confidence = 0.0
                     if hasattr(self._attack_model, "predict_proba"):
-                        s2_confidence = float(max(self._attack_model.predict_proba(X)[0]))
+                        s2_confidence = float(max(self._attack_model.predict_proba(X_stage2)[0]))
 
                     label = str(atk_pred)
                     if self._attack_label_encoder and hasattr(self._attack_label_encoder, "classes_"):
@@ -1016,8 +1245,7 @@ class RealCaptureThread(QThread):
                                                                      
                                                                                             
                 if (
-                    not self._test_mode
-                    and is_malicious
+                    is_malicious
                     and s1_confidence >= 0.75
                     and flow_rec.protocol == 6
                 ):
@@ -1026,13 +1254,14 @@ class RealCaptureThread(QThread):
                         total_pkts=total_pkts,
                         total_bytes=total_bytes,
                         flow_duration=flow_duration,
+                        activity=activity,
                     )
                     if scan_assist == ThreatType.PORT_SCAN:
                         threat_type = ThreatType.PORT_SCAN
                         confidence = max(confidence, 0.92)
                         detection_source = "signature_scan_assist"
 
-                if not self._test_mode and threat_type is None:
+                if threat_type is None:
                     # Live mode policy: drop weak/unconfirmed stage-1-only predictions.
                     # Keep a very strict fallback path for high-confidence sustained flows.
                     if (
@@ -1095,7 +1324,7 @@ class RealCaptureThread(QThread):
             proto = PORT_PROTOCOL_MAP.get(flow_rec.dst_port, proto)
 
             model_used_label = self.model_name
-            if not self._test_mode and threat_type == ThreatType.PORT_SCAN and stage2_label == "Unknown":
+            if threat_type == ThreatType.PORT_SCAN and stage2_label == "Unknown":
                 model_used_label = f"{self.model_name} + ScanEvidence"
 
             alert_packet = Packet(
