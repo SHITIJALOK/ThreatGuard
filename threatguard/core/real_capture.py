@@ -924,8 +924,8 @@ class RealCaptureThread(QThread):
             thresholds = self._thresholds()
             if flow_rec.protocol not in (6, 17):
                 return
-            # User policy: ignore HTTPS flows entirely for detection/prevention.
-            if flow_rec.protocol == 6 and (flow_rec.dst_port == 443 or flow_rec.src_port == 443):
+            # User policy: ignore HTTPS (port 443) flows entirely for detection/prevention.
+            if flow_rec.dst_port == 443 or flow_rec.src_port == 443:
                 return
 
             # Require stronger evidence for live-mode ML classification to reduce false positives
